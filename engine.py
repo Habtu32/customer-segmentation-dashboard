@@ -212,14 +212,29 @@ def date_diagnostics(df: pd.DataFrame) -> dict:
 # --------------------------------------------------------------------------------------
 # RFM, clustering, naming
 # --------------------------------------------------------------------------------------
-def quintile_scores(values: pd.Series, higher_is_better: bool) -> pd.Series:
-    """Quintile score 1-5. Ranks break ties, so every score gets one fifth of the customers."""
+TIE_RULES = {
+    "id": "Ties broken by Customer ID order (default)",
+    "file": "Ties broken by order of first appearance in the file",
+    "average": "Equal values always get the same score (no tie-breaking)",
+}
+
+
+def quintile_scores(values: pd.Series, higher_is_better: bool, ties: str = "id") -> pd.Series:
+    """Quintile score 1-5.
+
+    ties="id" / "file": ranks with method="first" split tied values across scores, so every score gets
+    one fifth of the customers; the row order decides who falls on which side of a tie.
+    ties="average": tied values share a score, so group sizes are not exactly equal.
+    """
+    if ties == "average":
+        pct = values.rank(method="average", pct=True, ascending=higher_is_better)
+        return np.ceil(pct * 5).clip(1, 5).astype(int)
     ranks = values.rank(method="first", ascending=higher_is_better)
     return pd.qcut(ranks, 5, labels=[1, 2, 3, 4, 5]).astype(int)
 
 
-def build_rfm(tx: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
-    grouped = tx.groupby("Customer ID")
+def build_rfm(tx: pd.DataFrame, reference_date: pd.Timestamp, ties: str = "id") -> pd.DataFrame:
+    grouped = tx.groupby("Customer ID", sort=(ties != "file"))
     rfm = pd.DataFrame(
         {
             "Customer Name": grouped["Customer Name"].first(),
@@ -230,9 +245,9 @@ def build_rfm(tx: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
         }
     )
     rfm["Recency"] = (reference_date - rfm["Last Order"]).dt.days.astype(int)
-    rfm["R"] = quintile_scores(rfm["Recency"], higher_is_better=False)  # recent = 5
-    rfm["F"] = quintile_scores(rfm["Frequency"], higher_is_better=True)
-    rfm["M"] = quintile_scores(rfm["Monetary"], higher_is_better=True)
+    rfm["R"] = quintile_scores(rfm["Recency"], higher_is_better=False, ties=ties)  # recent = 5
+    rfm["F"] = quintile_scores(rfm["Frequency"], higher_is_better=True, ties=ties)
+    rfm["M"] = quintile_scores(rfm["Monetary"], higher_is_better=True, ties=ties)
     rfm["RFM"] = rfm["R"] + rfm["F"] + rfm["M"]
     return rfm.reset_index()
 
@@ -265,7 +280,7 @@ class Result:
     focus: pd.DataFrame | None = None
 
 
-def run_pipeline(df: pd.DataFrame, date_source: str = "rebuilt") -> Result:
+def run_pipeline(df: pd.DataFrame, date_source: str = "rebuilt", ties: str = "id") -> Result:
     """Run the whole analysis. `date_source` is 'rebuilt' (Year + weeknum) or 'original'."""
     df = df.copy()
     info = date_diagnostics(df)
@@ -281,7 +296,7 @@ def run_pipeline(df: pd.DataFrame, date_source: str = "rebuilt") -> Result:
         raise DataError("All dates failed to parse.")
 
     reference_date = df["OrderDate"].max() + pd.Timedelta(days=1)
-    rfm = build_rfm(df, reference_date)
+    rfm = build_rfm(df, reference_date, ties)
 
     scaled = StandardScaler().fit_transform(rfm[["R", "F", "M"]].astype(float))
     model = KMeans(n_clusters=K_CLUSTERS, random_state=RANDOM_STATE, n_init=N_INIT).fit(scaled)
@@ -328,6 +343,20 @@ def run_pipeline(df: pd.DataFrame, date_source: str = "rebuilt") -> Result:
         result.focus = focus_subcategories(tx.merge(rfm[["Customer ID", "Segment"]].rename(
             columns={"Segment": "Account"}), on="Customer ID", how="left"))
     return result
+
+
+def compare_tie_rules(df: pd.DataFrame, date_source: str = "rebuilt") -> pd.DataFrame:
+    """Run the pipeline under each tie rule: cluster sizes, silhouette and chi-square p-value."""
+    rows = []
+    for key, label in TIE_RULES.items():
+        res = run_pipeline(df, date_source, key)
+        chi = chi_square(res.customers)
+        row = {"Rule": label}
+        row.update({name: int(res.profile.loc[name, "Customers"]) for name in CLUSTER_ORDER})
+        row["Silhouette"] = round(res.silhouette, 2)
+        row["Chi-square p"] = round(chi["p"], 3)
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------------------
