@@ -200,8 +200,13 @@ def load_demo() -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Running RFM scoring and K-Means...")
-def analyze(df: pd.DataFrame, date_source: str) -> E.Result:
-    return E.run_pipeline(df, date_source)
+def analyze(df: pd.DataFrame, date_source: str, ties: str = "id") -> E.Result:
+    return E.run_pipeline(df, date_source, ties)
+
+
+@st.cache_data(show_spinner="Comparing tie rules...")
+def compare_rules(df: pd.DataFrame, date_source: str) -> pd.DataFrame:
+    return E.compare_tie_rules(df, date_source)
 
 
 @st.cache_data(show_spinner="Checking model quality...")
@@ -258,10 +263,16 @@ with st.sidebar:
             "so the report rebuilds dates as the Monday of each recorded week.",
         )
     date_source = "rebuilt" if (has_week and date_choice.startswith("Rebuild")) else "original"
+    with st.expander("Advanced: quintile tie rule"):
+        tie_key = st.selectbox(
+            "How are tied values scored?", list(E.TIE_RULES), format_func=lambda k: E.TIE_RULES[k],
+            help="Frequency and Recency have many tied values. The rule used for ties changes some scores, "
+            "and therefore some cluster sizes. See the comparison on the Model & data quality tab.",
+        )
     st.caption(f"Source: {source_label}")
 
 try:
-    result = analyze(raw_df, date_source)
+    result = analyze(raw_df, date_source, tie_key)
 except E.DataError as exc:
     st.error(str(exc))
     st.stop()
@@ -741,6 +752,18 @@ with tab_model:
             st.caption("Demo data is synthetic, so differences from the report are expected.")
         else:
             st.caption("Small differences can come from the quintile tie-breaking rule or the date source; see the README.")
+
+    st.markdown("##### Does the tie rule explain a difference from the report?")
+    comp = compare_rules(raw_df, date_source)
+    ref_sizes = E.REPORT_REFERENCE["cluster_sizes"]
+    comp = pd.concat(
+        [comp, pd.DataFrame([{"Rule": "Final report", **ref_sizes, "Silhouette": E.REPORT_REFERENCE["silhouette"],
+                              "Chi-square p": E.REPORT_REFERENCE["p_value"]}])],
+        ignore_index=True,
+    )
+    st.dataframe(comp, hide_index=True)
+    st.caption("Pick the rule whose cluster sizes and p-value match the report row, in the sidebar under "
+               "Advanced. If none matches, the report used another scoring step (for example, a different date or frequency definition).")
 
     section("Data quality", "Why the report rebuilds the Order Date.")
     info = result.date_info
